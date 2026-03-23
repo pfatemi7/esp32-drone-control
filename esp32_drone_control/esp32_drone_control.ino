@@ -22,8 +22,8 @@ static constexpr uint8_t MONITOR_PIN = 48;
 
 // One LIDAR reading approximately every 100 ms.
 static constexpr uint32_t READ_PERIOD_MS = 100;
-// 50 ms timeout covers up to very long pulse widths while keeping loop responsive.
-static constexpr uint32_t PULSE_TIMEOUT_US = 60000;
+// Keep timeout short so distance checks do not starve velocity/altitude control updates.
+static constexpr uint32_t PULSE_TIMEOUT_US = 12000;
 
 static uint32_t last_read_ms = 0;
 static uint32_t last_pulse_us = 0;
@@ -37,17 +37,22 @@ static uint32_t timeout_count = 0;
 // ========================= NEW: Flight-control mission constants =========================
 static constexpr uint8_t COMPANION_SYS_ID = 200;
 static constexpr uint8_t COMPANION_COMP_ID = MAV_COMP_ID_ONBOARD_COMPUTER;
+
 static constexpr uint32_t COMPANION_HEARTBEAT_PERIOD_MS = 1000;
 static constexpr uint32_t FC_HEARTBEAT_TIMEOUT_MS = 4000;
+
 static constexpr uint32_t FC_COMMAND_RETRY_MS = 1200;
-static constexpr float TARGET_TAKEOFF_ALT_M = 0.5f;
+static constexpr float TARGET_TAKEOFF_ALT_M = 1.5f;
 static constexpr float ALTITUDE_TOLERANCE_M = 0.1f;
 static constexpr float LAND_NEAR_GROUND_M = 0.15f;
 static constexpr float OBSTACLE_TRIGGER_M = 1.0f;
-static constexpr uint8_t OBSTACLE_CONSECUTIVE_HITS_REQUIRED = 3;
+static constexpr float LIDAR_MIN_VALID_DISTANCE_M = 0.01f;
+static constexpr float LIDAR_NO_SIGNAL_REPORT_DISTANCE_M = 40.0f;
+static constexpr uint8_t OBSTACLE_CONSECUTIVE_HITS_REQUIRED = 1;
+static constexpr float FORWARD_SPEED_MPS = 0.5f;
+static constexpr uint32_t FORWARD_COMMAND_PERIOD_MS = 100;
 static constexpr uint32_t BOOT_WAIT_MS = 5000;
-static constexpr uint32_t HOLD_DURATION_MS = 5000;
-static constexpr uint32_t ALT_DRIFT_PRINT_MS = 1000;
+static constexpr uint32_t ALTITUDE_SETTLE_WAIT_MS = 5000;
 static constexpr uint32_t STREAM_REQUEST_PERIOD_MS = 5000;
 static constexpr uint16_t STREAM_RATE_HZ = 4;
 
@@ -63,8 +68,8 @@ enum MissionState : uint8_t {
   SET_GUIDED,
   ARMING,
   TAKEOFF,
-  HOLD_AT_0P5M,
-  MONITOR_LIDAR,
+  WAIT_ALTITUDE_CHECK,
+  FORWARD_FLIGHT,
   LANDING,
   DISARMING,
   FAILSAFE_LAND,
@@ -77,9 +82,7 @@ static uint32_t mission_state_enter_ms = 0;
 static bool mission_state_action_sent = false;
 static uint32_t last_command_sent_ms = 0;
 static uint32_t boot_start_ms = 0;
-static uint32_t hold_start_ms = 0;
 static uint8_t obstacle_hit_count = 0;
-static uint32_t last_alt_drift_print_ms = 0;
 
 static uint8_t fc_target_sysid = 0;
 static uint8_t fc_target_compid = 0;
@@ -93,6 +96,7 @@ static char fc_mode_text[16] = "UNKNOWN";
 static uint16_t last_ack_command = 0;
 static uint8_t last_ack_result = 255;
 static uint32_t last_stream_request_ms = 0;
+static uint32_t last_forward_command_ms = 0;
 static bool fc_gpi_ever_received = false;
 // =====================================================================================
 
@@ -111,6 +115,7 @@ static void processIncomingMavlink(uint32_t now);
 static void sendSetMode(uint32_t customMode, const char *label);
 static void sendArmDisarm(bool arm, const char *label);
 static void sendTakeoff(float altMeters);
+static void sendForwardVelocity(float forwardSpeedMps);
 static void sendLand(const char *label);
 static void runMissionStateMachine(uint32_t now);
 static bool isFcLinkConnected(uint32_t now);
@@ -135,11 +140,14 @@ static void drawScreen() {
 
   display.setFont(ArialMT_Plain_16);
   char line4[32];
+  float reportedDistanceM = LIDAR_NO_SIGNAL_REPORT_DISTANCE_M;
   if (last_read_ok) {
-    snprintf(line4, sizeof(line4), "%.2f m", last_distance_cm / 100.0f);
-  } else {
-    snprintf(line4, sizeof(line4), "NO SIGNAL");
+    const float measuredM = last_distance_cm / 100.0f;
+    if (measuredM >= LIDAR_MIN_VALID_DISTANCE_M) {
+      reportedDistanceM = measuredM;
+    }
   }
+  snprintf(line4, sizeof(line4), "%.2f m", reportedDistanceM);
   display.drawString(0, 38, line4);
 
   // ========================= NEW: Flight-control OLED extension =========================
@@ -236,10 +244,10 @@ static const char *missionStateName(MissionState state) {
       return "ARMING";
     case TAKEOFF:
       return "TAKEOFF";
-    case HOLD_AT_0P5M:
-      return "HOLD_0P5";
-    case MONITOR_LIDAR:
-      return "MONITOR";
+    case WAIT_ALTITUDE_CHECK:
+      return "ALT_CHECK";
+    case FORWARD_FLIGHT:
+      return "FORWARD";
     case LANDING:
       return "LANDING";
     case DISARMING:
@@ -358,11 +366,11 @@ static void changeMissionState(MissionState next, const char *reason, uint32_t n
   mission_state = next;
   mission_state_enter_ms = now;
   mission_state_action_sent = false;
-  if (next != HOLD_AT_0P5M) {
-    hold_start_ms = 0;
-  }
-  if (next != MONITOR_LIDAR) {
+  if (next != FORWARD_FLIGHT) {
     obstacle_hit_count = 0;
+  }
+  if (next != FORWARD_FLIGHT) {
+    last_forward_command_ms = 0;
   }
 }
 
@@ -371,8 +379,8 @@ static bool shouldRunHeartbeatFailsafe(MissionState state) {
     case SET_GUIDED:
     case ARMING:
     case TAKEOFF:
-    case HOLD_AT_0P5M:
-    case MONITOR_LIDAR:
+    case WAIT_ALTITUDE_CHECK:
+    case FORWARD_FLIGHT:
     case LANDING:
     case DISARMING:
       return true;
@@ -558,6 +566,33 @@ static void sendTakeoff(float altMeters) {
   Serial.println(ok ? "sent" : "send failed");
 }
 
+static void sendForwardVelocity(float forwardSpeedMps) {
+  if (!fc_seen_heartbeat) {
+    Serial.println("[MAVLINK] Cannot send forward velocity: waiting for FC heartbeat");
+    return;
+  }
+
+  mavlink_message_t msg;
+  // Ignore position/acceleration/yaw fields, use only velocity (vx, vy, vz).
+  const uint16_t typeMask = 0x0DC7;
+
+  mavlink_msg_set_position_target_local_ned_pack(
+    COMPANION_SYS_ID, COMPANION_COMP_ID, &msg,
+    millis(),
+    fc_target_sysid, fc_target_compid,
+    MAV_FRAME_BODY_NED,
+    typeMask,
+    0.0f, 0.0f, 0.0f,          // position ignored
+    forwardSpeedMps, 0.0f, 0.0f,  // vx, vy, vz (hold altitude with vz=0)
+    0.0f, 0.0f, 0.0f,          // acceleration ignored
+    0.0f, 0.0f);               // yaw and yaw_rate ignored
+
+  const bool ok = sendMavlinkMessage(msg);
+  if (!ok) {
+    Serial.println("[MAVLINK] FORWARD velocity command send failed");
+  }
+}
+
 static void sendLand(const char *label) {
   if (!fc_seen_heartbeat) {
     Serial.println("[MAVLINK] Cannot land: waiting for FC heartbeat");
@@ -628,50 +663,52 @@ static void runMissionStateMachine(uint32_t now) {
     } break;
 
     case TAKEOFF: {
-      if (shouldRetryStateAction(now)) {
+      if (!mission_state_action_sent) {
         sendTakeoff(TARGET_TAKEOFF_ALT_M);
         mission_state_action_sent = true;
         last_command_sent_ms = now;
-      }
-      if (isAltitudeWithinTargetBand()) {
-        Serial.print("[MISSION] Takeoff altitude reached: ");
-        Serial.print(fc_relative_alt_m, 3);
-        Serial.println(" m");
-        changeMissionState(HOLD_AT_0P5M, "altitude in target band", now);
-      } else if (isAltValid() && now - last_alt_drift_print_ms >= ALT_DRIFT_PRINT_MS) {
-        last_alt_drift_print_ms = now;
-        Serial.print("[MISSION] Waiting for target altitude, current=");
-        Serial.print(fc_relative_alt_m, 3);
-        Serial.println(" m");
+        changeMissionState(WAIT_ALTITUDE_CHECK, "takeoff command sent, waiting 5s", now);
       }
     } break;
 
-    case HOLD_AT_0P5M: {
+    case WAIT_ALTITUDE_CHECK: {
+      if (now - mission_state_enter_ms < ALTITUDE_SETTLE_WAIT_MS) {
+        break;
+      }
+
       if (isAltitudeWithinTargetBand()) {
-        if (hold_start_ms == 0) {
-          hold_start_ms = now;
-          Serial.println("[MISSION] Hold timer started at target altitude");
-        } else if (now - hold_start_ms >= HOLD_DURATION_MS) {
-          changeMissionState(MONITOR_LIDAR, "held at 0.5m for 5s", now);
-        }
+        Serial.print("[MISSION] Altitude check passed after 5s, current=");
+        Serial.print(fc_relative_alt_m, 3);
+        Serial.println(" m");
+        changeMissionState(FORWARD_FLIGHT, "altitude stable, start forward flight + obstacle monitor", now);
       } else {
-        if (hold_start_ms != 0) {
-          Serial.print("[MISSION] Altitude drifted out of tolerance (");
-          if (isAltValid()) {
-            Serial.print(fc_relative_alt_m, 3);
-            Serial.println(" m). Resetting hold timer.");
-          } else {
-            Serial.println("no altitude). Resetting hold timer.");
-          }
+        Serial.print("[MISSION] Altitude check failed after 5s, current=");
+        if (isAltValid()) {
+          Serial.print(fc_relative_alt_m, 3);
+          Serial.println(" m. Re-sending takeoff command.");
+        } else {
+          Serial.println("no altitude data. Re-sending takeoff command.");
         }
-        hold_start_ms = 0;
+        changeMissionState(TAKEOFF, "altitude not close to 1.0m", now);
       }
     } break;
 
-    case MONITOR_LIDAR: {
+    case FORWARD_FLIGHT: {
+      // Resend GUIDED velocity setpoint periodically so FC keeps speed/altitude stable.
+      if ((now - last_forward_command_ms) >= FORWARD_COMMAND_PERIOD_MS) {
+        sendForwardVelocity(FORWARD_SPEED_MPS);
+        last_forward_command_ms = now;
+      }
+
       if (last_read_ok) {
         const float obstacle_m = last_distance_cm / 100.0f;
-        if (obstacle_m <= OBSTACLE_TRIGGER_M) {
+        if (obstacle_m < LIDAR_MIN_VALID_DISTANCE_M) {
+          // Ignore invalid zero/near-zero PWM readings (remapped to 40 m for display).
+          if (obstacle_hit_count > 0) {
+            Serial.println("[MISSION] Ignoring invalid LIDAR distance, counter reset");
+            obstacle_hit_count = 0;
+          }
+        } else if (obstacle_m <= OBSTACLE_TRIGGER_M) {
           if (obstacle_hit_count < 255) {
             obstacle_hit_count++;
           }
@@ -803,38 +840,42 @@ void loop() {
   runMissionStateMachine(now);
   // ============================================================================================
 
-  if (now - last_read_ms < READ_PERIOD_MS) {
-    return;
-  }
-  last_read_ms = now;
+  // Keep distance checks on fixed timing without skipping control loop iterations.
+  if (now - last_read_ms >= READ_PERIOD_MS) {
+    last_read_ms = now;
 
-  uint32_t pulseUs = 0;
-  float distanceCm = 0.0f;
+    uint32_t pulseUs = 0;
+    float distanceCm = 0.0f;
 
-  last_read_ok = readLidarPwm(pulseUs, distanceCm);
-  if (last_read_ok) {
-    last_pulse_us = pulseUs;
-    last_distance_cm = distanceCm;
-    Serial.print("Distance: ");
-    Serial.print(distanceCm / 100.0f, 3);
-    Serial.print(" m (");
-    Serial.print(distanceCm, 1);
-    Serial.print(" cm), pulse ");
-    Serial.print(last_pulse_polarity);
-    Serial.print(" from ");
-    Serial.print(last_read_source);
-    Serial.print(", trig ");
-    Serial.println(last_trigger_mode);
-    timeout_count = 0;
-  } else {
-    timeout_count++;
-    Serial.print("LIDAR read timeout, monitor level=");
-    Serial.print(digitalRead(MONITOR_PIN));
-    Serial.print(", trig level=");
-    Serial.println(digitalRead(TRIGGER_PIN));
-    if (timeout_count % 20 == 0) {
-      Serial.println("Hint: LIDAR-Lite v3 typically needs a clean 5V supply.");
-      Serial.println("Hint: PWM output can be 5V; use a divider/level-shifter into ESP32.");
+    last_read_ok = readLidarPwm(pulseUs, distanceCm);
+    if (last_read_ok) {
+      if (distanceCm < (LIDAR_MIN_VALID_DISTANCE_M * 100.0f)) {
+        // Treat zero/near-zero invalid reads as max-range report distance.
+        distanceCm = LIDAR_NO_SIGNAL_REPORT_DISTANCE_M * 100.0f;
+      }
+      last_pulse_us = pulseUs;
+      last_distance_cm = distanceCm;
+      Serial.print("Distance: ");
+      Serial.print(distanceCm / 100.0f, 3);
+      Serial.print(" m (");
+      Serial.print(distanceCm, 1);
+      Serial.print(" cm), pulse ");
+      Serial.print(last_pulse_polarity);
+      Serial.print(" from ");
+      Serial.print(last_read_source);
+      Serial.print(", trig ");
+      Serial.println(last_trigger_mode);
+      timeout_count = 0;
+    } else {
+      timeout_count++;
+      Serial.print("LIDAR read timeout, monitor level=");
+      Serial.print(digitalRead(MONITOR_PIN));
+      Serial.print(", trig level=");
+      Serial.println(digitalRead(TRIGGER_PIN));
+      if (timeout_count % 20 == 0) {
+        Serial.println("Hint: LIDAR-Lite v3 typically needs a clean 5V supply.");
+        Serial.println("Hint: PWM output can be 5V; use a divider/level-shifter into ESP32.");
+      }
     }
   }
 
