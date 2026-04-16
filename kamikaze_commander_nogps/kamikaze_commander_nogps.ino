@@ -24,7 +24,7 @@ static constexpr uint8_t  LORA_SYNC_WORD  = 0x12;
 static constexpr int8_t   LORA_TX_POWER   = 22;
 static constexpr uint16_t LORA_PREAMBLE   = 8;
 
-static constexpr float  TAKEOFF_ALT_M  = 1.5f;
+static constexpr float  TAKEOFF_ALT_M  = 3.0f;
 
 static constexpr uint8_t CMD_MAGIC_0 = 'K';
 static constexpr uint8_t CMD_MAGIC_1 = 'C';

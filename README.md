@@ -24,11 +24,11 @@ Radio parameters (915 MHz, SF12, etc.) must match between sketches.
 
 ## Drone mission (`CMD_START_AUTO_MISSION` from commander PRG)
 
-After GUIDED, arm, and takeoff to `TARGET_TAKEOFF_ALT_M`, the companion runs a **2 m square** in **NED** sense relative to the captured origin: **north → east → south → west**, using **WGS84-style offsets** (Earth radius `6378137` m) to compute target lat/lon, then `SET_POSITION_TARGET_GLOBAL_INT` for each corner.
+After GUIDED, arm, and takeoff to `TARGET_TAKEOFF_ALT_M` (**default 3.0 m**), the companion runs a **50 m square** in **NED** sense relative to the captured origin: **north → east → south → west**, using **WGS84-style offsets** (Earth radius `6378137` m) to compute target lat/lon, then `SET_POSITION_TARGET_GLOBAL_INT` for each corner.
 
 **Horizontal speed** to those targets is **not** set in this firmware; ArduPilot chooses speed from parameters such as **`WPNAV_SPEED`** (and acceleration limits).
 
-During **`SQUARE_NAV`**, **LIDAR** is still evaluated each control tick: if range is valid and below **`OBSTACLE_TRIGGER_M`** for **`OBSTACLE_CONSECUTIVE_HITS_REQUIRED`** consecutive hits, the companion commands **LAND** (same idea as the older forward-flight mission).
+During **`SQUARE_NAV`**, **LIDAR** is still evaluated each control tick: if range is valid and **`<= OBSTACLE_TRIGGER_M`** (default **1.0 m**) for **`OBSTACLE_CONSECUTIVE_HITS_REQUIRED`** consecutive hits (default **1**), the companion commands **LAND** (same idea as the older forward-flight mission).
 
 ## LIDAR (LIDAR-Lite v3 PWM)
 

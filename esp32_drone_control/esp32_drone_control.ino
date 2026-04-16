@@ -156,7 +156,7 @@ static constexpr uint32_t COMPANION_HEARTBEAT_PERIOD_MS = 1000;
 static constexpr uint32_t FC_HEARTBEAT_TIMEOUT_MS = 4000;
 
 static constexpr uint32_t FC_COMMAND_RETRY_MS = 1200;
-static constexpr float TARGET_TAKEOFF_ALT_M = 1.5f;
+static constexpr float TARGET_TAKEOFF_ALT_M = 3.0f;
 static constexpr float ALTITUDE_TOLERANCE_M = 0.1f;
 static constexpr float LAND_NEAR_GROUND_M = 0.15f;
 static constexpr float OBSTACLE_TRIGGER_M = 1.0f;
@@ -167,7 +167,7 @@ static constexpr uint32_t BOOT_WAIT_MS = 5000;
 static constexpr uint32_t ALTITUDE_SETTLE_WAIT_MS = 5000;
 static constexpr uint32_t STREAM_REQUEST_PERIOD_MS = 5000;
 static constexpr uint16_t STREAM_RATE_HZ = 4;
-static constexpr float SQUARE_LEG_DISTANCE_M = 2.0f;
+static constexpr float SQUARE_LEG_DISTANCE_M = 50.0f;
 static constexpr float SQUARE_WAYPOINT_REACHED_THRESHOLD_M = 0.8f;
 
 // ArduCopter custom modes requested.
@@ -1036,7 +1036,7 @@ static void runMissionStateMachine(uint32_t now) {
         square_origin_lat_e7 = fc_lat_e7;
         square_origin_lon_e7 = fc_lon_e7;
         square_leg_index = 0;
-        changeMissionState(SQUARE_NAV, "altitude stable, start 2m square mission", now);
+        changeMissionState(SQUARE_NAV, "altitude stable, start 50m square mission", now);
       } else {
         Serial.print("[MISSION] Altitude check failed after 5s, current=");
         if (isAltValid()) {
@@ -1100,13 +1100,13 @@ static void runMissionStateMachine(uint32_t now) {
         float northOffsetM = 0.0f;
         float eastOffsetM = 0.0f;
         if (square_leg_index == 0) {
-          northOffsetM = SQUARE_LEG_DISTANCE_M;                    // 2m north
+          northOffsetM = SQUARE_LEG_DISTANCE_M;                    // 50m north
         } else if (square_leg_index == 1) {
-          northOffsetM = SQUARE_LEG_DISTANCE_M; eastOffsetM = SQUARE_LEG_DISTANCE_M;   // then 2m east
+          northOffsetM = SQUARE_LEG_DISTANCE_M; eastOffsetM = SQUARE_LEG_DISTANCE_M;   // then 50m east
         } else if (square_leg_index == 2) {
-          eastOffsetM = SQUARE_LEG_DISTANCE_M;                     // then 2m south
+          eastOffsetM = SQUARE_LEG_DISTANCE_M;                     // then 50m south
         } else {
-          northOffsetM = 0.0f; eastOffsetM = 0.0f;                // then 2m west (back to origin)
+          northOffsetM = 0.0f; eastOffsetM = 0.0f;                // then 50m west (back to origin)
         }
 
         offsetLatLonByMeters(square_origin_lat_e7, square_origin_lon_e7,
